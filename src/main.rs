@@ -210,6 +210,133 @@ fn process_document_update(
     send_message(stdout, &notification);
 }
 
+// -- Handlers ------------------------------------------------------------------
+
+/// Generates code actions based on the cached statix diagnostic output and fix suggestions.
+fn handle_code_action(params: Value, documents: &HashMap<String, Document>) -> Vec<Value> {
+    let mut actions = Vec::new();
+
+    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+    let range = &params["range"];
+    let req_start_line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
+    let req_end_line = range["end"]["line"].as_u64().unwrap_or(0) as u32;
+
+    let doc = match documents.get(uri) {
+        Some(d) => d,
+        None => return actions,
+    };
+
+    // Quick fixes from the JSON output
+    if let Some(output) = &doc.output {
+        actions.extend(
+            output
+                .report
+                .iter()
+                .flat_map(|report| &report.diagnostics)
+                .filter_map(|diag| diag.suggestion.as_ref().map(|sugg| (diag, sugg)))
+                .filter_map(|(diag, sugg)| {
+                    let from_line = sugg.at.from.line.saturating_sub(1);
+                    let to_line = sugg.at.to.line.saturating_sub(1);
+
+                    // Check if request range overlaps with the suggestion span
+                    if req_start_line <= to_line && req_end_line >= from_line {
+                        let from_col = sugg.at.from.column.saturating_sub(1);
+                        let to_col = sugg.at.to.column.saturating_sub(1);
+
+                        Some(json!({
+                            "title": format!("Fix: {}", diag.message),
+                            "kind": "quickfix",
+                            "isPreferred": true,
+                            "edit": {
+                                "changes": {
+                                    uri: [{
+                                        "range": {
+                                            "start": { "line": from_line, "character": from_col },
+                                            "end": { "line": to_line, "character": to_col }
+                                        },
+                                        "newText": sugg.fix
+                                    }]
+                                }
+                            }
+                        }))
+                    } else {
+                        None
+                    }
+                }),
+        );
+    }
+
+    actions
+}
+
+/// Called when a document is opened. Runs statix and publishes diagnostics.
+fn handle_did_open(
+    params: Value,
+    documents: &mut HashMap<String, Document>,
+    stdout: &mut impl std::io::Write,
+) {
+    let uri = params["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let text = params["textDocument"]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    process_document_update(uri, text, documents, stdout);
+}
+
+/// Called when a document is modified. Re-runs statix and updates diagnostics.
+fn handle_did_change(
+    params: Value,
+    documents: &mut HashMap<String, Document>,
+    stdout: &mut impl std::io::Write,
+) {
+    let uri = params["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if let Some(text) = params["contentChanges"][0]["text"].as_str() {
+        process_document_update(uri, text.to_string(), documents, stdout);
+    }
+}
+
+/// Called when a document is saved. Re-runs statix on the cached content.
+fn handle_did_save(
+    params: Value,
+    documents: &mut HashMap<String, Document>,
+    stdout: &mut impl std::io::Write,
+) {
+    let uri = params["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if let Some(text) = documents.get(&uri).map(|d| d.text.clone()) {
+        process_document_update(uri, text, documents, stdout);
+    }
+}
+
+/// Called when a document is closed. Removes it from cache and clears diagnostics.
+fn handle_did_close(
+    params: Value,
+    documents: &mut HashMap<String, Document>,
+    stdout: &mut impl std::io::Write,
+) {
+    let uri = params["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    documents.remove(&uri);
+    send_message(
+        stdout,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": { "uri": uri, "diagnostics": [] }
+        }),
+    );
+}
+
 // -- Main loop -----------------------------------------------------------------
 
 fn main() {
@@ -232,7 +359,7 @@ fn main() {
             "initialize" => {
                 let response = RpcResponse {
                     jsonrpc: "2.0",
-                    id: req.id.unwrap_or_else(|| json!(null)),
+                    id: req.id.unwrap_or(Value::Null),
                     result: json!({
                         "capabilities": {
                             "textDocumentSync": {
@@ -251,7 +378,7 @@ fn main() {
             "shutdown" => {
                 let response = RpcResponse {
                     jsonrpc: "2.0",
-                    id: req.id.unwrap_or_else(|| json!(null)),
+                    id: req.id.unwrap_or(Value::Null),
                     result: json!(null),
                 };
                 send_message(&mut stdout, &serde_json::to_value(response).unwrap());
@@ -262,60 +389,25 @@ fn main() {
             // -- Document lifecycle -----------------------------------------
             "textDocument/didOpen" => {
                 if let Some(params) = req.params {
-                    let uri = params["textDocument"]["uri"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let text = params["textDocument"]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    process_document_update(uri, text, &mut documents, &mut stdout);
+                    handle_did_open(params, &mut documents, &mut stdout);
                 }
             }
 
             "textDocument/didChange" => {
                 if let Some(params) = req.params {
-                    let uri = params["textDocument"]["uri"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(text) = params["contentChanges"][0]["text"].as_str() {
-                        process_document_update(uri, text.to_string(), &mut documents, &mut stdout);
-                    }
+                    handle_did_change(params, &mut documents, &mut stdout);
                 }
             }
 
             "textDocument/didSave" => {
                 if let Some(params) = req.params {
-                    let uri = params["textDocument"]["uri"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(text) = documents.get(&uri).map(|d| d.text.clone()) {
-                        // Re-run on the currently cached text content
-                        process_document_update(uri, text, &mut documents, &mut stdout);
-                    }
+                    handle_did_save(params, &mut documents, &mut stdout);
                 }
             }
 
             "textDocument/didClose" => {
                 if let Some(params) = req.params {
-                    let uri = params["textDocument"]["uri"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    documents.remove(&uri);
-
-                    // Clear diagnostics for the closed file
-                    send_message(
-                        &mut stdout,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "method": "textDocument/publishDiagnostics",
-                            "params": { "uri": uri, "diagnostics": [] }
-                        }),
-                    );
+                    handle_did_close(params, &mut documents, &mut stdout);
                 }
             }
 
@@ -326,50 +418,9 @@ fn main() {
                     None => continue,
                 };
 
-                let mut actions = Vec::new();
-
-                if let Some(params) = req.params {
-                    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
-                    let range = &params["range"];
-                    let req_start_line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
-                    let req_end_line = range["end"]["line"].as_u64().unwrap_or(0) as u32;
-
-                    // Use the cached statix output instead of spawning a new process
-                    if let Some(doc) = documents.get(uri) {
-                        if let Some(output) = &doc.output {
-                            for report in &output.report {
-                                for diag in &report.diagnostics {
-                                    if let Some(sugg) = &diag.suggestion {
-                                        let from_line = sugg.at.from.line.saturating_sub(1);
-                                        let to_line = sugg.at.to.line.saturating_sub(1);
-
-                                        // Check if request range overlaps with the suggestion span
-                                        if req_start_line <= to_line && req_end_line >= from_line {
-                                            let from_col = sugg.at.from.column.saturating_sub(1);
-                                            let to_col = sugg.at.to.column.saturating_sub(1);
-
-                                            actions.push(json!({
-                                                "title": format!("Fix: {}", diag.message),
-                                                "kind": "quickfix",
-                                                "edit": {
-                                                    "changes": {
-                                                        uri: [{
-                                                            "range": {
-                                                                "start": { "line": from_line, "character": from_col },
-                                                                "end": { "line": to_line, "character": to_col }
-                                                            },
-                                                            "newText": sugg.fix
-                                                        }]
-                                                    }
-                                                }
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let actions = req
+                    .params
+                    .map_or_else(Vec::new, |p| handle_code_action(p, &documents));
 
                 send_message(
                     &mut stdout,
